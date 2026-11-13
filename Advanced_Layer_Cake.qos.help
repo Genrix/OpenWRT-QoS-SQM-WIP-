@@ -1,4 +1,4 @@
-Advanced Layer Cake: egress classification by DSCP/IP/proto/port, DSCP marking
-for CAKE tins, ingress transfer via conntrack + act_ctinfo.
-Config: /etc/config/advanced_layer_cake
-Designed for WAN interface. Reboot to switch to another preset.
+CAKE with DSCP rules from /etc/config/advanced_layer_cake. Match client DSCP,
+addresses, protocols and destination ports. Restore the connection's DSCP
+on download. For classification, disable firewall flow offloading and allow
+ingress DSCP in SQM.

@@ -3,7 +3,6 @@
 # Advanced Layer Cake - egress traffic classification config.
 # Sieve principle: traffic is matched top-to-bottom, first match wins.
 # Empty value '' means "do not check this field".
-# Maximum 15 classes.
 
 config class 'Downloads'
     option match_dscp      '8'
