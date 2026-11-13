@@ -1,0 +1,70 @@
+# /etc/config/advanced_layer_cake
+#
+# Advanced Layer Cake - egress traffic classification config.
+# Sieve principle: traffic is matched top-to-bottom, first match wins.
+# Empty value '' means "do not check this field".
+# Maximum 15 classes.
+
+config class 'Downloads'
+    option match_dscp      '8'
+    option match_src_ip    ''
+    option match_dst_ip    ''
+    option match_protocol  ''
+    option match_port      ''
+    option set_dscp        '8'
+
+config class 'Games'
+    option match_dscp      '46'
+    option match_src_ip    ''
+    option match_dst_ip    ''
+    option match_protocol  ''
+    option match_port      ''
+    option set_dscp        '46'
+
+config class 'Browser'
+    option match_dscp      '0'
+    option match_src_ip    ''
+    option match_dst_ip    ''
+    option match_protocol  'TCP'
+    option match_port      '80, 443, 8443'
+    option set_dscp        '20'
+
+config class 'IPTV'
+    option match_dscp      ''
+    option match_src_ip    ''
+    option match_dst_ip    '10.10.1.20'
+    option match_protocol  ''
+    option match_port      ''
+    option set_dscp        '34'
+
+config class 'Stream'
+    option match_dscp      ''
+    option match_src_ip    ''
+    option match_dst_ip    ''
+    option match_protocol  'TCP'
+    option match_port      '1935'
+    option set_dscp        '34'
+
+config class 'IPCall'
+    option match_dscp      '40'
+    option match_src_ip    ''
+    option match_dst_ip    ''
+    option match_protocol  'UDP'
+    option match_port      ''
+    option set_dscp        '40'
+
+config class 'Network'
+    option match_dscp      ''
+    option match_src_ip    ''
+    option match_dst_ip    ''
+    option match_protocol  ''
+    option match_port      '53, 67, 68, 123, 853, 5222, 5228, 5353'
+    option set_dscp        '46'
+
+config class 'Unknown'
+    option match_dscp      ''
+    option match_src_ip    ''
+    option match_dst_ip    ''
+    option match_protocol  ''
+    option match_port      ''
+    option set_dscp        '0'
