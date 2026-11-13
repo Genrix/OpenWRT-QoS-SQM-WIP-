@@ -1,654 +1,299 @@
-#!/bin/sh
-# Advanced_Layer_Cake.qos
-# Egress classification by DSCP/IP/proto/port, DSCP marking for CAKE,
-# ingress transfer via conntrack + act_ctinfo.
-# Config: /etc/config/advanced_layer_cake
+# Advanced Layer Cake for sqm-scripts on OpenWrt 25.12.
+# The SQM runner sources this file on both start and stop.
 
-PATH=/usr/sbin:/usr/bin:/sbin:/bin
-export PATH
+SUPPORT_MQ=1
+QDISC=cake
+ALC_CONFIG=advanced_layer_cake
 
-CONFIG_FILE="/etc/config/advanced_layer_cake"
-MAX_CLASSES=15
-BASE_MARK=256
+# Six contiguous DSCP bits and a separate validity bit (including for CS0).
+# Leave all other conntrack bits and the packet mark alone.
+ALC_DSCP_MASK=0xfc000000
+ALC_VALID=0x01000000
+ALC_MASK=0xfd000000
+ALC_KEEP=0x02ffffff
 
-TMP_PREFIX="/tmp/advanced_layer_cake.$$"
-TMP_NFT="$TMP_PREFIX.nft"
-TMP_RESTORE="$TMP_PREFIX.restore"
-TMP_CLASSIFY="$TMP_PREFIX.classify"
-
-log() {
-    logger -t ALC -p daemon.err "$*"
+alc_table_name() {
+    printf 'alc_'
+    printf '%s' "$IFACE" | hexdump -ve '1/1 "%02x"'
 }
 
-die() {
-    log "$*"
-    exit 1
+alc_dscp() {
+    local value
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    value=$(printf '%s' "$1" | sed 's/^0*//')
+    value=${value:-0}
+    [ "${#value}" -le 2 ] && [ "$value" -le 63 ] || return 1
+    printf '%s' "$value"
 }
 
-HAVE_SQM_TC=0
-command -v sqm_tc >/dev/null 2>&1 && HAVE_SQM_TC=1
+alc_dscp_mark() {
+    printf '0x%02x000000' "$(( ($1 << 2) | 1 ))"
+}
 
-HAVE_SQM_IP=0
-command -v sqm_ip >/dev/null 2>&1 && HAVE_SQM_IP=1
+# Accept only characters belonging to address or port lists. nft -c validates
+# the actual addresses, prefixes, ranges and port numbers as a single batch.
+alc_list() {
+    local value
+    value=$(printf '%s' "$1" | tr -d ' \t')
+    case "$value" in
+        '' ) ;;
+        ,*|*,|*,,*) return 1 ;;
+        *[!0-9A-Fa-f:.,/-]*) return 1 ;;
+    esac
+    printf '%s' "$value"
+}
 
-tc_cmd() {
-    if [ "$HAVE_SQM_TC" = 1 ]; then
-        sqm_tc "$@"
-    else
-        tc "$@"
+alc_addr_family() {
+    case "$1" in
+        *:*) printf 'ip6' ;;
+        ?*) printf 'ip' ;;
+    esac
+}
+
+alc_rule_error() {
+    sqm_error "Advanced Layer Cake: class '$1': invalid $2"
+    return 1
+}
+
+alc_class() {
+    local section="$1" dscp match_dscp src dst protocols ports
+    local src_family dst_family family match mark protocol transport l4
+
+    config_get dscp "$section" set_dscp
+    config_get match_dscp "$section" match_dscp
+    config_get src "$section" match_src_ip
+    config_get dst "$section" match_dst_ip
+    config_get protocols "$section" match_protocol
+    config_get ports "$section" match_port
+
+    dscp=$(alc_dscp "$dscp") || { alc_rule_error "$section" set_dscp; return 1; }
+    if [ -n "$match_dscp" ]; then
+        match_dscp=$(alc_dscp "$match_dscp") ||
+            { alc_rule_error "$section" match_dscp; return 1; }
     fi
-}
-
-ip_cmd() {
-    if [ "$HAVE_SQM_IP" = 1 ]; then
-        sqm_ip "$@"
-    else
-        ip "$@"
-    fi
-}
-
-run_tc() {
-    _out=$(tc_cmd "$@" 2>&1)
-    _rc=$?
-    if [ $_rc -ne 0 ]; then
-        log "TC CMD FAILED: $*"
-        log "TC OUTPUT: $_out"
+    src=$(alc_list "$src") || { alc_rule_error "$section" match_src_ip; return 1; }
+    dst=$(alc_list "$dst") || { alc_rule_error "$section" match_dst_ip; return 1; }
+    src_family=$(alc_addr_family "$src")
+    dst_family=$(alc_addr_family "$dst")
+    if [ -n "$src_family" ] && [ -n "$dst_family" ] && [ "$src_family" != "$dst_family" ]; then
+        alc_rule_error "$section" 'combination of source and destination families'
         return 1
     fi
-    return 0
-}
 
-remove_spaces() {
-    printf '%s' "$1" | tr -d ' \t\n\r'
-}
-
-normalize_uint() {
-    _s=$(remove_spaces "$1")
-    case "$_s" in
-        ''|*[!0-9]*)
-            return 1
-            ;;
+    ports=$(alc_list "$ports") || { alc_rule_error "$section" match_port; return 1; }
+    case "$ports" in
+        *[!0-9,-]*) alc_rule_error "$section" match_port; return 1 ;;
     esac
-
-    while [ "${_s#0}" != "$_s" ] && [ "${#_s}" -gt 1 ]; do
-        _s=${_s#0}
-    done
-
-    [ -n "$_s" ] || _s=0
-    printf '%s' "$_s"
-}
-
-normalize_ipv4() {
-    _in=$1
-    [ -n "$_in" ] || return 1
-
-    case "$_in" in
-        *[!0-9.]*)
-            return 1
-            ;;
+    protocols=$(printf '%s' "$protocols" | tr -d ' \t' | tr 'A-Z' 'a-z')
+    case "$protocols" in
+        ,*|*,|*,,*|*[!a-z0-9,]*) alc_rule_error "$section" match_protocol; return 1 ;;
     esac
-
-    _oldIFS=$IFS
-    IFS='.'
-    set -- $_in
-    IFS=$_oldIFS
-
-    [ $# -eq 4 ] || return 1
-
-    _out=""
-    for _o in "$@"; do
-        _v=$(normalize_uint "$_o") || return 1
-        [ "$_v" -le 255 ] || return 1
-
-        if [ -z "$_out" ]; then
-            _out="$_v"
-        else
-            _out="$_out.$_v"
-        fi
-    done
-
-    printf '%s' "$_out"
-}
-
-ip_to_int() {
-    _oldIFS=$IFS
-    IFS='.'
-    set -- $1
-    IFS=$_oldIFS
-
-    printf '%s' $(( ($1 * 16777216) + ($2 * 65536) + ($3 * 256) + $4 ))
-}
-
-normalize_ipv4_range() {
-    case "$1" in
-        *-*)
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-
-    _start=${1%%-*}
-    _end=${1##*-}
-    [ -n "$_start" ] && [ -n "$_end" ] || return 1
-
-    _nstart=$(normalize_ipv4 "$_start") || return 1
-    _nend=$(normalize_ipv4 "$_end") || return 1
-
-    [ "$(ip_to_int "$_nstart")" -le "$(ip_to_int "$_nend")" ] || return 1
-
-    printf '%s-%s' "$_nstart" "$_nend"
-}
-
-normalize_ipv4_cidr() {
-    case "$1" in
-        */*)
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-
-    _addr=${1%/*}
-    _pref=${1##*/}
-    [ -n "$_addr" ] && [ -n "$_pref" ] || return 1
-
-    _naddr=$(normalize_ipv4 "$_addr") || return 1
-    _npref=$(normalize_uint "$_pref") || return 1
-    [ "$_npref" -le 32 ] || return 1
-
-    printf '%s/%s' "$_naddr" "$_npref"
-}
-
-normalize_ip_list() {
-    _in=$(remove_spaces "$1")
-    [ -n "$_in" ] || return 1
-
-    _oldIFS=$IFS
-    IFS=','
-    set -- $_in
-    IFS=$_oldIFS
-
-    [ $# -gt 0 ] || return 1
-
-    _out=""
-    for _e in "$@"; do
-        [ -n "$_e" ] || return 1
-
-        case "$_e" in
-            */*)
-                _ne=$(normalize_ipv4_cidr "$_e") || return 1
-                ;;
-            *-*)
-                _ne=$(normalize_ipv4_range "$_e") || return 1
-                ;;
-            *)
-                _ne=$(normalize_ipv4 "$_e") || return 1
-                ;;
+    transport=$(printf '%s' "${protocols:-${ports:+tcp,udp}}" | tr ',' ' ')
+    for protocol in $transport; do
+        case "$protocol:${src_family:-$dst_family}" in
+            tcp:*|udp:*|icmp:|icmp:ip|icmpv6:|icmpv6:ip6) ;;
+            *) alc_rule_error "$section" match_protocol; return 1 ;;
         esac
-
-        if [ -z "$_out" ]; then
-            _out="$_ne"
-        else
-            _out="$_out,$_ne"
-        fi
     done
+    if [ "$ALC_CATCHALL" = 1 ]; then
+        sqm_error "Advanced Layer Cake: class '$section' follows a catch-all"
+        return 1
+    fi
+    if [ -z "$match_dscp$src$dst$protocols$ports" ]; then
+        ALC_CATCHALL=1
+    fi
 
-    printf '%s' "$_out"
-}
+    mark=$(alc_dscp_mark "$dscp")
+    for family in ${src_family:-${dst_family:-ip ip6}}; do
+        match="meta nfproto ipv4"
+        [ "$family" = ip6 ] && match="meta nfproto ipv6"
+        [ -z "$src" ] || match="$match $family saddr { $src }"
+        [ -z "$dst" ] || match="$match $family daddr { $dst }"
+        [ -z "$match_dscp" ] || match="$match $family dscp $match_dscp"
 
-normalize_port_list() {
-    _in=$(remove_spaces "$1")
-    [ -n "$_in" ] || return 1
-
-    _oldIFS=$IFS
-    IFS=','
-    set -- $_in
-    IFS=$_oldIFS
-
-    [ $# -gt 0 ] || return 1
-
-    _out=""
-    for _e in "$@"; do
-        [ -n "$_e" ] || return 1
-
-        case "$_e" in
-            *-*)
-                _start=${_e%%-*}
-                _end=${_e##*-}
-                [ -n "$_start" ] && [ -n "$_end" ] || return 1
-
-                _p1=$(normalize_uint "$_start") || return 1
-                _p2=$(normalize_uint "$_end") || return 1
-
-                [ "$_p1" -le 65535 ] || return 1
-                [ "$_p2" -le 65535 ] || return 1
-                [ "$_p1" -le "$_p2" ] || return 1
-
-                _elem="$_p1-$_p2"
-                ;;
-            *)
-                _p=$(normalize_uint "$_e") || return 1
-                [ "$_p" -le 65535 ] || return 1
-                _elem="$_p"
-                ;;
-        esac
-
-        if [ -z "$_out" ]; then
-            _out="$_elem"
-        else
-            _out="$_out,$_elem"
+        # ICMP has no ports. In a mixed protocol rule, the port condition
+        # applies only to the TCP/UDP branches, as in the original config.
+        if [ -z "$transport" ]; then
+            printf '  %s counter ct mark set ct mark & %s | %s return comment "%s"\n' \
+                "$match" "$ALC_KEEP" "$mark" "$section"
+            continue
         fi
-    done
-
-    printf '%s' "$_out"
-}
-
-normalize_protocol_list() {
-    _in=$(printf '%s' "$1" | tr -d ' \t\n\r' | tr '[:lower:]' '[:upper:]')
-    [ -n "$_in" ] || return 1
-
-    _oldIFS=$IFS
-    IFS=','
-    set -- $_in
-    IFS=$_oldIFS
-
-    [ $# -gt 0 ] || return 1
-
-    _out=""
-    for _p in "$@"; do
-        case "$_p" in
-            TCP|UDP|ICMP)
-                ;;
-            *)
-                return 1
-                ;;
-        esac
-
-        if [ -z "$_out" ]; then
-            _out="$_p"
-        else
-            _out="$_out,$_p"
-        fi
-    done
-
-    printf '%s' "$_out"
-}
-
-ip_nft_expr() {
-    _field=$1
-    _val=$2
-
-    case "$_val" in
-        *,*|*-*)
-            printf 'ip %s {%s}' "$_field" "$_val"
-            ;;
-        *)
-            printf 'ip %s %s' "$_field" "$_val"
-            ;;
-    esac
-}
-
-port_nft_expr() {
-    case "$1" in
-        *,*|*-*)
-            printf '{%s}' "$1"
-            ;;
-        *)
-            printf '%s' "$1"
-            ;;
-    esac
-}
-
-add_classify_rule() {
-    printf '        oifname "%s" %s ct mark set %s ip dscp set %s\n' \
-        "$IFACE" "$1" "$mark" "$dscp" >> "$TMP_CLASSIFY" \
-        || die "Failed to write temporary classification rules."
-}
-
-setup_cake() {
-    _dev=$1
-    _bw=$2
-
-    run_tc qdisc add dev "$_dev" root cake bandwidth "${_bw}kbit" $cake_opts \
-        || die "Failed to add CAKE qdisc on $_dev."
-}
-
-trap 'rm -f "$TMP_NFT" "$TMP_RESTORE" "$TMP_CLASSIFY"' EXIT
-
-: > "$TMP_RESTORE" 2>/dev/null || die "Cannot create temporary rule files."
-: > "$TMP_CLASSIFY" 2>/dev/null || die "Cannot create temporary rule files."
-
-IFACE="${IFACE:-$DEVICE}"
-[ -n "$IFACE" ] || die "No interface specified. Set IFACE or DEVICE via SQM."
-
-command -v nft >/dev/null 2>&1 || die "nft not found. Install nftables."
-
-if [ "$HAVE_SQM_TC" = 0 ]; then
-    command -v tc >/dev/null 2>&1 || die "tc not found. Install tc."
-fi
-
-if [ "$HAVE_SQM_IP" = 0 ]; then
-    command -v ip >/dev/null 2>&1 || die "ip not found."
-fi
-
-command -v uci >/dev/null 2>&1 || die "uci not found."
-
-[ -f "$CONFIG_FILE" ] || die "Config file not found: $CONFIG_FILE"
-
-# Explicitly load required TC action and classifier modules.
-for mod in act_pedit act_mirred act_ctinfo cls_u32 cls_fw cls_flower ifb; do
-    modprobe "$mod" >/dev/null 2>&1
-done
-
-CTINFO_OK=0
-[ -d /sys/module/act_ctinfo ] && CTINFO_OK=1
-grep -q "^act_ctinfo " /proc/modules 2>/dev/null && CTINFO_OK=1
-grep -q "act_ctinfo" "/lib/modules/$(uname -r)/modules.builtin" 2>/dev/null && CTINFO_OK=1
-
-if [ "$CTINFO_OK" = 0 ]; then
-    modprobe act_ctinfo >/dev/null 2>&1
-    [ -d /sys/module/act_ctinfo ] && CTINFO_OK=1
-    grep -q "^act_ctinfo " /proc/modules 2>/dev/null && CTINFO_OK=1
-fi
-
-[ "$CTINFO_OK" = 1 ] || die "act_ctinfo kernel module missing. Install: opkg install kmod-sched-ctinfo"
-
-IFB="ifb4$IFACE"
-TABLE="alc_$(printf '%s' "$IFACE" | sed 's/[^a-zA-Z0-9]/_/g')"
-
-# Idempotent cleanup for same-preset restart.
-nft delete table ip "$TABLE" 2>/dev/null
-tc_cmd qdisc del dev "$IFACE" root 2>/dev/null
-tc_cmd qdisc del dev "$IFACE" ingress 2>/dev/null
-tc_cmd filter del dev "$IFACE" parent ffff: 2>/dev/null
-tc_cmd qdisc del dev "$IFB" root 2>/dev/null
-ip_cmd link del "$IFB" 2>/dev/null
-
-UPLINK_RAW=$(printf '%s' "${UPLINK:-}" | sed 's/[[:space:]]//g; s/[Kk]bit$//')
-DOWNLINK_RAW=$(printf '%s' "${DOWNLINK:-}" | sed 's/[[:space:]]//g; s/[Kk]bit$//')
-
-UPLINK=$(normalize_uint "$UPLINK_RAW") || die "Invalid or empty UPLINK."
-DOWNLINK=$(normalize_uint "$DOWNLINK_RAW") || die "Invalid or empty DOWNLINK."
-
-[ "$UPLINK" -gt 0 ] || die "UPLINK must be greater than 0."
-[ "$DOWNLINK" -gt 0 ] || die "DOWNLINK must be greater than 0."
-
-if [ -n "${OVERHEAD:-}" ]; then
-    OVERHEAD_RAW=$(remove_spaces "$OVERHEAD")
-    if [ -n "$OVERHEAD_RAW" ]; then
-        OVERHEAD=$(normalize_uint "$OVERHEAD_RAW") || die "Invalid OVERHEAD."
-    fi
-fi
-
-cake_opts="diffserv"
-
-if [ -n "${OVERHEAD:-}" ]; then
-    cake_opts="$cake_opts overhead $OVERHEAD"
-fi
-
-ll=$(printf '%s' "${LINKLAYER:-}" | tr '[:upper:]' '[:lower:]')
-case "$ll" in
-    atm)
-        cake_opts="$cake_opts atm"
-        ;;
-    ptm)
-        cake_opts="$cake_opts ptm"
-        ;;
-    ethernet|ether|eth)
-        cake_opts="$cake_opts noatm"
-        ;;
-    none|'')
-        ;;
-    *)
-        log "Unknown LINKLAYER '$LINKLAYER', ignoring."
-        ;;
-esac
-
-if [ -n "${RTT:-}" ]; then
-    case "$RTT" in
-        *[!A-Za-z0-9.:_/-]*)
-            log "Invalid RTT '$RTT', ignoring."
-            ;;
-        *)
-            cake_opts="$cake_opts rtt $RTT"
-            ;;
-    esac
-fi
-
-class_count=0
-class_pairs=""
-has_catchall=0
-
-idx=0
-while uci -q get "advanced_layer_cake.@class[$idx]" >/dev/null; do
-    i=$idx
-    idx=$((idx + 1))
-
-    if [ "$class_count" -ge "$MAX_CLASSES" ]; then
-        log "Maximum $MAX_CLASSES classes reached; remaining sections ignored."
-        break
-    fi
-
-    section_label=$(uci -q show "advanced_layer_cake.@class[$i]" 2>/dev/null | head -n1 | sed 's/^advanced_layer_cake\.//; s/=.*$//')
-    [ -n "$section_label" ] || section_label="index_$i"
-
-    raw_set_dscp=$(remove_spaces "$(uci -q get "advanced_layer_cake.@class[$i].set_dscp")")
-    if [ -z "$raw_set_dscp" ]; then
-        log "Section '$section_label' skipped: set_dscp is missing."
-        continue
-    fi
-
-    set_dscp=$(normalize_uint "$raw_set_dscp") || {
-        log "Section '$section_label' skipped: invalid set_dscp='$raw_set_dscp'."
-        continue
-    }
-
-    [ "$set_dscp" -le 63 ] || {
-        log "Section '$section_label' skipped: set_dscp out of range 0-63."
-        continue
-    }
-
-    match_dscp=""
-    raw_match_dscp=$(remove_spaces "$(uci -q get "advanced_layer_cake.@class[$i].match_dscp")")
-    if [ -n "$raw_match_dscp" ]; then
-        match_dscp=$(normalize_uint "$raw_match_dscp") || {
-            log "Section '$section_label' skipped: invalid match_dscp='$raw_match_dscp'."
-            continue
-        }
-
-        [ "$match_dscp" -le 63 ] || {
-            log "Section '$section_label' skipped: match_dscp out of range 0-63."
-            continue
-        }
-    fi
-
-    match_src_ip=""
-    raw_match_src_ip=$(remove_spaces "$(uci -q get "advanced_layer_cake.@class[$i].match_src_ip")")
-    if [ -n "$raw_match_src_ip" ]; then
-        match_src_ip=$(normalize_ip_list "$raw_match_src_ip") || {
-            log "Section '$section_label' skipped: invalid match_src_ip='$raw_match_src_ip'."
-            continue
-        }
-    fi
-
-    match_dst_ip=""
-    raw_match_dst_ip=$(remove_spaces "$(uci -q get "advanced_layer_cake.@class[$i].match_dst_ip")")
-    if [ -n "$raw_match_dst_ip" ]; then
-        match_dst_ip=$(normalize_ip_list "$raw_match_dst_ip") || {
-            log "Section '$section_label' skipped: invalid match_dst_ip='$raw_match_dst_ip'."
-            continue
-        }
-    fi
-
-    match_protocol=""
-    raw_match_protocol=$(remove_spaces "$(uci -q get "advanced_layer_cake.@class[$i].match_protocol")")
-    if [ -n "$raw_match_protocol" ]; then
-        match_protocol=$(normalize_protocol_list "$raw_match_protocol") || {
-            log "Section '$section_label' skipped: invalid match_protocol='$raw_match_protocol'. Allowed: TCP, UDP, ICMP."
-            continue
-        }
-    fi
-
-    match_port=""
-    raw_match_port=$(remove_spaces "$(uci -q get "advanced_layer_cake.@class[$i].match_port")")
-    if [ -n "$raw_match_port" ]; then
-        match_port=$(normalize_port_list "$raw_match_port") || {
-            log "Section '$section_label' skipped: invalid match_port='$raw_match_port'."
-            continue
-        }
-    fi
-
-    if [ -z "$match_dscp" ] && [ -z "$match_src_ip" ] && [ -z "$match_dst_ip" ] && \
-       [ -z "$match_protocol" ] && [ -z "$match_port" ]; then
-        has_catchall=1
-    fi
-
-    class_count=$((class_count + 1))
-    mark=$(printf '0x%04X' $((BASE_MARK + class_count)))
-    dscp=$set_dscp
-
-    class_pairs="$class_pairs $mark:$dscp"
-
-    printf '        oifname "%s" ct mark %s ip dscp set %s\n' \
-        "$IFACE" "$mark" "$dscp" >> "$TMP_RESTORE" \
-        || die "Failed to write temporary restore rules."
-
-    log "Class $class_count '$section_label': mark=$mark set_dscp=$dscp"
-
-    common="ct mark 0"
-    [ -n "$match_dscp" ] && common="$common ip dscp $match_dscp"
-    [ -n "$match_src_ip" ] && common="$common $(ip_nft_expr saddr "$match_src_ip")"
-    [ -n "$match_dst_ip" ] && common="$common $(ip_nft_expr daddr "$match_dst_ip")"
-
-    if [ -z "$match_protocol" ]; then
-        if [ -n "$match_port" ]; then
-            pexpr=$(port_nft_expr "$match_port")
-            add_classify_rule "$common ip protocol tcp tcp dport $pexpr"
-            add_classify_rule "$common ip protocol udp udp dport $pexpr"
-        else
-            add_classify_rule "$common"
-        fi
-    else
-        oldIFS=$IFS
-        IFS=','
-        set -- $match_protocol
-        IFS=$oldIFS
-
-        for p in "$@"; do
-            case "$p" in
-                ICMP)
-                    add_classify_rule "$common ip protocol icmp"
+        for protocol in $transport; do
+            case "$protocol" in
+                tcp|udp)
+                    l4="meta l4proto $protocol"
+                    [ -z "$ports" ] || l4="$l4 th dport { $ports }"
                     ;;
-                TCP)
-                    if [ -n "$match_port" ]; then
-                        add_classify_rule "$common ip protocol tcp tcp dport $(port_nft_expr "$match_port")"
-                    else
-                        add_classify_rule "$common ip protocol tcp"
-                    fi
+                icmp)
+                    [ "$family" = ip ] || continue
+                    l4='meta l4proto icmp'
                     ;;
-                UDP)
-                    if [ -n "$match_port" ]; then
-                        add_classify_rule "$common ip protocol udp udp dport $(port_nft_expr "$match_port")"
-                    else
-                        add_classify_rule "$common ip protocol udp"
-                    fi
+                icmpv6)
+                    [ "$family" = ip6 ] || continue
+                    l4='meta l4proto ipv6-icmp'
                     ;;
             esac
+            printf '  %s %s counter ct mark set ct mark & %s | %s return comment "%s"\n' \
+                "$match" "$l4" "$ALC_KEEP" "$mark" "$section"
         done
+    done
+}
+
+alc_compile() (
+    local sections section dscp
+    . /lib/functions.sh
+    if ! uci export "$ALC_CONFIG" >/dev/null || ! config_load "$ALC_CONFIG"; then
+        sqm_error "Advanced Layer Cake: cannot read /etc/config/$ALC_CONFIG"
+        return 1
     fi
-done
 
-if [ "$class_count" -eq 0 ]; then
-    log "No valid classes found; falling back to plain layer_cake behavior."
+    sections=$(config_foreach echo class)
+    [ -n "$sections" ] || return 2
+    # Destroy + recreate in one nft transaction. An absent table is fine.
+    printf 'destroy table inet %s\ntable inet %s {\n' "$ALC_TABLE" "$ALC_TABLE"
+    printf ' chain classify {\n'
+    ALC_CATCHALL=0
+    for section in $sections; do
+        # UCI identifiers are safe to include in nft comments.
+        case "$section" in *[!a-zA-Z0-9_]*) return 1 ;; esac
+        alc_class "$section" || return 1
+    done
+    if [ "$ALC_CATCHALL" = 0 ]; then
+        printf '  counter ct mark set ct mark & %s | %s return comment "Default CS0"\n' "$ALC_KEEP" "$ALC_VALID"
+    fi
+    printf ' }\n map restore {\n  type mark : verdict\n  elements = {\n'
+    # A verdict map lets nft set the six-bit DSCP field with a constant.
+    # Keep all values so open connections retain their class across reloads.
+    for dscp in $(seq 0 63); do
+        printf '   %s : goto dscp_%s,\n' "$(alc_dscp_mark "$dscp")" "$dscp"
+    done
+    printf '  }\n }\n'
+    for dscp in $(seq 0 63); do
+        printf ' chain dscp_%s {\n  ip dscp set %s return\n  ip6 dscp set %s\n }\n' "$dscp" "$dscp" "$dscp"
+    done
+    printf ' chain egress_classify {\n  type filter hook postrouting priority mangle + 1; policy accept;\n'
+    printf '  oifname != "%s" return\n' "$IFACE"
+    printf '  ct mark & %s vmap @restore\n' "$ALC_MASK"
+    printf '  ct state { invalid, untracked } return\n'
+    printf '  jump classify\n'
+    printf '  ct mark & %s vmap @restore\n }\n}\n' "$ALC_MASK"
+)
 
-    ip_cmd link add "$IFB" type ifb 2>/dev/null
-    ip_cmd link set "$IFB" up || die "Failed to bring up IFB device $IFB."
+alc_apply_cake() {
+    local device="$1" rate="$2" qdisc
+    shift 2
+    qdisc=$(select_cake "$device") || return 1
+    $TC qdisc replace dev "$device" root $(get_stab_string) "$qdisc" \
+        bandwidth "${rate}kbit" $(get_cake_lla_string) "$@"
+}
 
-    setup_cake "$IFACE" "$UPLINK"
+alc_start_ingress() {
+    local cake_opts="$INGRESS_CAKE_OPTS"
+    [ "$ALC_ACTIVE" = 0 ] || cake_opts="$cake_opts diffserv4 ingress"
+    [ "$IGNORE_DSCP_INGRESS" != 1 ] || cake_opts="$cake_opts besteffort"
+    [ "$ZERO_DSCP_INGRESS" != 1 ] || cake_opts="$cake_opts wash"
 
-    run_tc qdisc add dev "$IFACE" ingress || die "Failed to add ingress qdisc on $IFACE."
-
-    run_tc filter add dev "$IFACE" parent ffff: protocol ip prio 3 \
-        u32 match u32 0 0 action mirred egress redirect dev "$IFB" \
-        || die "Failed to add default ingress redirect filter."
-
-    setup_cake "$IFB" "$DOWNLINK"
-
-    log "Advanced Layer Cake fallback applied: iface=$IFACE ifb=$IFB up=${UPLINK}kbit down=${DOWNLINK}kbit"
-    exit 0
-fi
-
-if [ "$has_catchall" = 0 ]; then
-    if [ "$class_count" -lt "$MAX_CLASSES" ]; then
-        class_count=$((class_count + 1))
-        mark=$(printf '0x%04X' $((BASE_MARK + class_count)))
-        dscp=0
-
-        class_pairs="$class_pairs $mark:$dscp"
-
-        printf '        oifname "%s" ct mark %s ip dscp set %s\n' \
-            "$IFACE" "$mark" "$dscp" >> "$TMP_RESTORE" \
-            || die "Failed to write temporary restore rules."
-
-        printf '        oifname "%s" ct mark 0 ct mark set %s ip dscp set %s\n' \
-            "$IFACE" "$mark" "$dscp" >> "$TMP_CLASSIFY" \
-            || die "Failed to write temporary classification rules."
-
-        log "Added implicit Unknown fallback class: mark=$mark set_dscp=0"
+    DEV=$(ifb_name "$IFACE") || return 1
+    create_ifb "$DEV" || return 1
+    ALC_IFB_CREATED=1
+    alc_apply_cake "$DEV" "$DOWNLINK" $cake_opts $IQDISC_OPTS || return 1
+    $IP link set dev "$DEV" up || return 1
+    $TC qdisc add dev "$IFACE" handle ffff: ingress || return 1
+    ALC_INGRESS_CREATED=1
+    if [ "$ALC_ACTIVE" = 1 ]; then
+        set -- action ctinfo dscp "$ALC_DSCP_MASK" "$ALC_VALID" pipe
     else
-        log "Warning: no catch-all class present and class limit reached; unclassified egress traffic will not be marked."
+        set --
     fi
-fi
+    $TC filter add dev "$IFACE" parent ffff: protocol all prio 10 u32 match u32 0 0 \
+        "$@" action mirred egress redirect dev "$DEV"
+}
 
-{
-    printf 'table ip %s {\n' "$TABLE"
-    printf '    chain egress_classify {\n'
-    printf '        type filter hook postrouting priority mangle; policy accept;\n'
-    cat "$TMP_RESTORE"
-    cat "$TMP_CLASSIFY"
-    printf '    }\n'
-    printf '}\n'
-} > "$TMP_NFT" || die "Failed to write temporary nftables file."
+alc_start_exit() {
+    local status="$1"
+    if [ "$status" -ne 0 ]; then
+        [ "$ALC_TABLE_INSTALLED" = 0 ] || nft destroy table inet "$ALC_TABLE"
+        [ "$ALC_INGRESS_CREATED" = 0 ] || $TC qdisc del dev "$IFACE" ingress
+        [ "$ALC_IFB_CREATED" = 0 ] || delete_ifb "$DEV"
+        sqm_error "Advanced Layer Cake: could not start on $IFACE"
+    fi
+    rm -f "$ALC_RULES"
+}
 
-NFT_OUT=$(nft -f "$TMP_NFT" 2>&1)
-if [ $? -ne 0 ]; then
-    log "NFT CMD FAILED: nft -f $TMP_NFT"
-    log "NFT OUTPUT: $NFT_OUT"
-    die "Failed to apply nftables rules."
-fi
+sqm_start() (
+    local result cake_opts error
+    ALC_ACTIVE=0
+    ALC_TABLE_INSTALLED=0
+    ALC_IFB_CREATED=0
+    ALC_INGRESS_CREATED=0
+    [ "$UPLINK" -ne 0 ] || [ "$DOWNLINK" -ne 0 ] || return 0
+    case "$IFACE" in
+        ''|*[!a-zA-Z0-9_.:-]*) sqm_error "Advanced Layer Cake: invalid interface '$IFACE'"; return 1 ;;
+    esac
+    ALC_TABLE=$(alc_table_name) || return 1
+    ALC_RULES=$(mktemp) || return 1
+    trap 'alc_start_exit "$?"' EXIT
+    alc_compile > "$ALC_RULES"
+    result=$?
+    case "$result" in
+        0)
+            if [ "$(uci -q get 'firewall.@defaults[0].flow_offloading')" = 1 ] ||
+               [ "$(uci -q get 'firewall.@defaults[0].flow_offloading_hw')" = 1 ]; then
+                sqm_error 'Advanced Layer Cake: turn off firewall flow offloading to use classification'
+                return 1
+            fi
+            error=$(nft -c -f "$ALC_RULES" 2>&1) || {
+                sqm_error "Advanced Layer Cake: invalid nft rules: $error"
+                return 1
+            }
+            ALC_ACTIVE=1
+            ;;
+        2) ;;
+        *) return 1 ;;
+    esac
 
-ip_cmd link add "$IFB" type ifb 2>/dev/null
-ip_cmd link set "$IFB" up || die "Failed to bring up IFB device $IFB."
+    do_modules
+    verify_qdisc cake || return 1
+    if [ "$DOWNLINK" -ne 0 ]; then
+        alc_start_ingress || return 1
+    fi
+    if [ "$ALC_ACTIVE" = 1 ]; then
+        nft -f "$ALC_RULES" || return 1
+        ALC_TABLE_INSTALLED=1
+    fi
+    if [ "$UPLINK" -ne 0 ]; then
+        cake_opts="$EGRESS_CAKE_OPTS"
+        [ "$ALC_ACTIVE" = 0 ] || cake_opts="$cake_opts diffserv4"
+        alc_apply_cake "$IFACE" "$UPLINK" $cake_opts $EQDISC_OPTS || return 1
+    fi
+    return 0
+)
 
-setup_cake "$IFACE" "$UPLINK"
+alc_remove() {
+    local table
+    table=$(alc_table_name) || return 1
+    if command -v nft >/dev/null; then
+        nft destroy table inet "$table" ||
+            sqm_error "Advanced Layer Cake: could not remove nft table $table"
+    fi
+    if [ "$DOWNLINK" -ne 0 ] && [ -n "$CUR_IFB" ] &&
+       SILENT=1 $IP link show dev "$CUR_IFB" >/dev/null; then
+        SILENT=${1:-0} $IP link delete dev "$CUR_IFB" type ifb
+    fi
+}
 
-run_tc qdisc add dev "$IFACE" ingress || die "Failed to add ingress qdisc on $IFACE."
+# SQM 1.7.2's OpenWrt runner does not pass rates to stop-sqm. Read the
+# recorded rates so stopping a one-way instance only removes its own queues.
+sqm_stop() (
+    . "$STATE_FILE" || return 1
+    [ "$DOWNLINK" -eq 0 ] || SILENT=1 $TC qdisc del dev "$IFACE" ingress
+    [ "$UPLINK" -eq 0 ] || SILENT=1 $TC qdisc del dev "$IFACE" root
+    alc_remove
+)
 
-# prio 1: restore ct mark into skb->mark and continue to next filters.
-run_tc filter add dev "$IFACE" parent ffff: protocol ip prio 1 \
-    u32 match u32 0 0 action ctinfo cpmark 0xffffffff continue \
-    || die "Failed to add act_ctinfo ingress filter."
-
-# prio 2: per-class DSCP restore and redirect to IFB.
-for pair in $class_pairs; do
-    mark=${pair%%:*}
-    dscp=${pair##*:}
-    tos=$((dscp << 2))
-
-    run_tc filter add dev "$IFACE" parent ffff: protocol ip prio 2 \
-        u32 match mark "$mark" 0xffff \
-        action pedit munge ip ds set "$tos" pipe \
-        action mirred egress redirect dev "$IFB" \
-        || die "Failed to add ingress DSCP transfer filter for mark $mark."
-done
-
-# prio 3: unclassified traffic goes to IFB without DSCP change.
-run_tc filter add dev "$IFACE" parent ffff: protocol ip prio 3 \
-    u32 match u32 0 0 action mirred egress redirect dev "$IFB" \
-    || die "Failed to add default ingress redirect filter."
-
-setup_cake "$IFB" "$DOWNLINK"
-
-log "Advanced Layer Cake applied: iface=$IFACE ifb=$IFB table=$TABLE classes=$class_count up=${UPLINK}kbit down=${DOWNLINK}kbit"
-exit 0
+sqm_cleanup() (
+    . "$STATE_FILE" || return 1
+    alc_remove "${1:-0}"
+)
